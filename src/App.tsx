@@ -1,5 +1,5 @@
 // src/App.tsx
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Youtube, Zap, Film, Download, ChevronRight, Loader2,
   CheckCircle2, AlertCircle, Sparkles, ArrowLeft,
@@ -13,6 +13,12 @@ import {
   saveProject, defaultEdits, generateId, getApiKey,
   type Project, type ProjectClip, type ClipEdits,
 } from "./lib/storage";
+import {
+  getTempVideoUrl,
+  fetchAndStoreTempVideo,
+  fetchAndStoreExportedClip,
+  listStoredExportIds,
+} from "./lib/videoDB";
 
 const API_BASE = "http://localhost:3001";
 
@@ -34,14 +40,76 @@ export default function App() {
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [editingMoment, setEditingMoment] = useState<ViralMoment | null>(null);
   const [clipEdits, setClipEdits] = useState<Record<string, ClipEdits>>({});
+
+  // exportedUrls: momentId → objectURL (ephemeral, from IndexedDB blob)
   const [exportedUrls, setExportedUrls] = useState<Record<string, string>>({});
+
   const [isLoading, setIsLoading] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadPct, setDownloadPct] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportingId, setExportingId] = useState<string | null>(null);
   const [progressMsg, setProgressMsg] = useState("");
   const [error, setError] = useState("");
   const [activePanel, setActivePanel] = useState<"moments" | "export">("moments");
+
+  // Track current objectURL so we can revoke it on cleanup
+  const videoObjectUrlRef = useRef<string | null>(null);
+
+  // ─── On project load: restore video objectURL from IndexedDB ──────────────
+  useEffect(() => {
+    if (!project?.videoId) return;
+    if (project.localVideoUrl) return; // already set
+
+    (async () => {
+      const url = await getTempVideoUrl(project.videoId);
+      if (url) {
+        // Revoke previous
+        if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
+        videoObjectUrlRef.current = url;
+        setProject((p) => p ? { ...p, localVideoUrl: url } : p);
+      }
+    })();
+  }, [project?.videoId]);
+
+  // ─── On project load: restore exported clip objectURLs from IndexedDB ─────
+  useEffect(() => {
+    if (!project) return;
+    (async () => {
+      const storedIds = await listStoredExportIds();
+      if (storedIds.length === 0) return;
+
+      const momentIds = project.analysisResult.moments.map((m) => m.id);
+      const relevant  = storedIds.filter((id) => momentIds.includes(id));
+      if (relevant.length === 0) return;
+
+      const entries = await Promise.all(
+        relevant.map(async (momentId) => {
+          const { getTempVideoUrl: _, getExportedClip } = await import("./lib/videoDB");
+          const result = await getExportedClip(momentId);
+          return result ? ([momentId, result.url] as [string, string]) : null;
+        })
+      );
+
+      const restored: Record<string, string> = {};
+      for (const entry of entries) {
+        if (entry) restored[entry[0]] = entry[1];
+      }
+      if (Object.keys(restored).length > 0) {
+        setExportedUrls((prev) => ({ ...restored, ...prev }));
+      }
+    })();
+  }, [project?.id]);
+
+  // ─── Revoke objectURLs on unmount ─────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
+      Object.values(exportedUrls).forEach((url) => {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+      });
+    };
+  }, []);
 
   // ─── STEP 1: Analyze video ─────────────────────────────────────────────────
   async function handleAnalyze(url: string) {
@@ -57,7 +125,6 @@ export default function App() {
     setStep("analyzing");
 
     try {
-      // 1. Get video metadata from backend
       const infoRes = await fetch(`${API_BASE}/api/video-info?url=${encodeURIComponent(url)}`);
       if (!infoRes.ok) {
         const body = await infoRes.json().catch(() => ({}));
@@ -65,10 +132,8 @@ export default function App() {
       }
       const videoInfo = await infoRes.json();
 
-      // 2. Detect viral moments via AI
       const result = await detectViralMoments(videoInfo, apiKey, (msg) => setProgressMsg(msg));
 
-      // 3. Build project and persist to localStorage
       const proj: Project = {
         id: generateId(),
         videoUrl: url,
@@ -77,6 +142,7 @@ export default function App() {
         videoThumbnail: videoInfo.thumbnail,
         videoDuration: videoInfo.duration,
         localVideoUrl: undefined,
+        localVideoFileName: undefined,
         analysisResult: result,
         selectedClips: [],
         createdAt: Date.now(),
@@ -99,14 +165,16 @@ export default function App() {
     }
   }
 
-  // ─── Download video ────────────────────────────────────────────────────────
+  // ─── Download video → IndexedDB ───────────────────────────────────────────
   async function handleDownloadVideo() {
     if (!project || project.localVideoUrl) return;
 
     setIsDownloading(true);
-    setProgressMsg("Downloading video from YouTube… (may take a minute)");
+    setDownloadPct(0);
+    setProgressMsg("Asking server to download video…");
 
     try {
+      // 1. Ask server to download via yt-dlp
       const res = await fetch(`${API_BASE}/api/download`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -116,15 +184,37 @@ export default function App() {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || body.error || "Download failed");
       }
-      const data = await res.json();
+      const data: { url: string; fileName: string } = await res.json();
 
-      const updated: Project = { ...project, localVideoUrl: data.url, updatedAt: Date.now() };
+      // 2. Fetch the video blob from local server → store in IndexedDB
+      setProgressMsg("Saving video to browser storage…");
+      const objectUrl = await fetchAndStoreTempVideo(
+        data.url,
+        project.videoId,
+        data.fileName,
+        (pct) => {
+          setDownloadPct(pct);
+          setProgressMsg(`Saving to browser storage… ${pct}%`);
+        }
+      );
+
+      // Revoke previous objectURL if any
+      if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
+      videoObjectUrlRef.current = objectUrl;
+
+      const updated: Project = {
+        ...project,
+        localVideoUrl:      objectUrl,
+        localVideoFileName: data.fileName,
+        updatedAt:          Date.now(),
+      };
       setProject(updated);
       saveProject(updated);
     } catch (err: any) {
       setError(err.message);
     } finally {
       setIsDownloading(false);
+      setDownloadPct(0);
       setProgressMsg("");
     }
   }
@@ -153,9 +243,9 @@ export default function App() {
     setClipEdits((prev) => ({ ...prev, [editingMoment.id]: edits }));
   }
 
-  // ─── Export clip ───────────────────────────────────────────────────────────
+  // ─── Export clip → IndexedDB ──────────────────────────────────────────────
   async function handleExportClip(moment: ViralMoment, edits: ClipEdits) {
-    if (!project?.localVideoUrl) {
+    if (!project?.localVideoFileName) {
       setError("Please download the video first before exporting.");
       return;
     }
@@ -164,23 +254,25 @@ export default function App() {
     setExportingId(moment.id);
 
     try {
+      // 1. Ask server to render the clip (it reads the file from its local disk)
       const res = await fetch(`${API_BASE}/api/export-clip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          // Send only the filename — server resolves full path from TEMP_DIR
-          sourceFile: project.localVideoUrl.split("/").pop()!,
+          // Pass the server-side filename, NOT a URL or objectURL
+          sourceFile: project.localVideoFileName,
           clip: {
             startTime: moment.startTime + edits.trimStart,
-            endTime: moment.endTime + edits.trimEnd,
-            label: moment.label,
+            endTime:   moment.endTime   + edits.trimEnd,
+            label:     moment.label,
           },
           edits: {
             ...edits,
-            // Strip internal fields not needed by ffmpeg
-            textOverlays: edits.textOverlays.map(({ text, x, y, fontSize, color, startSec, endSec }) => ({
-              text, x, y, fontSize, color, startSec, endSec,
-            })),
+            textOverlays: edits.textOverlays.map(
+              ({ text, x, y, fontSize, color, startSec, endSec }) => ({
+                text, x, y, fontSize, color, startSec, endSec,
+              })
+            ),
           },
         }),
       });
@@ -189,8 +281,16 @@ export default function App() {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || body.error || "Export failed");
       }
-      const data = await res.json();
-      setExportedUrls((prev) => ({ ...prev, [moment.id]: data.url }));
+      const data: { url: string; fileName: string } = await res.json();
+
+      // 2. Fetch exported clip blob from server → store in IndexedDB
+      const objectUrl = await fetchAndStoreExportedClip(
+        data.url,
+        moment.id,
+        data.fileName
+      );
+
+      setExportedUrls((prev) => ({ ...prev, [moment.id]: objectUrl }));
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -199,7 +299,7 @@ export default function App() {
     }
   }
 
-  // ─── Derived: clips array for ExportPanel ──────────────────────────────────
+  // ─── Derived: clips array for ExportPanel ─────────────────────────────────
   const selectedClips: ProjectClip[] = selectedClipIds
     .map((id) => {
       const moment = project?.analysisResult.moments.find((m) => m.id === id);
@@ -208,15 +308,11 @@ export default function App() {
     })
     .filter(Boolean) as ProjectClip[];
 
-  // ─── Render: Input / Analyzing screen ─────────────────────────────────────
+  // ─── Render: Input / Analyzing ────────────────────────────────────────────
   if (step === "input" || step === "analyzing") {
     return (
       <>
-        <YouTubeInput
-          onAnalyze={handleAnalyze}
-          isLoading={isLoading}
-          error={error}
-        />
+        <YouTubeInput onAnalyze={handleAnalyze} isLoading={isLoading} error={error} />
         {progressMsg && <ProgressToast message={progressMsg} />}
       </>
     );
@@ -224,15 +320,13 @@ export default function App() {
 
   if (!project) return null;
 
-  // ─── Render: Main workspace ────────────────────────────────────────────────
+  // ─── Render: Main workspace ───────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-white flex flex-col">
-      {/* Top accent line */}
       <div className="h-px bg-gradient-to-r from-transparent via-violet-500 to-transparent" />
 
       {/* ── Header ── */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-white/[0.05] shrink-0">
-        {/* Left: back + logo */}
         <div className="flex items-center gap-4">
           <button
             onClick={() => {
@@ -258,7 +352,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Center: video title */}
         <div className="flex-1 max-w-md mx-8 hidden md:block min-w-0">
           <div className="flex items-center gap-2 text-xs text-zinc-600 truncate">
             <Youtube size={12} className="text-red-500 shrink-0" />
@@ -266,7 +359,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right: actions */}
         <div className="flex items-center gap-3">
           {!project.localVideoUrl ? (
             <button
@@ -275,7 +367,10 @@ export default function App() {
               className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.05] border border-white/[0.08] text-xs hover:bg-white/10 transition-colors disabled:opacity-50"
             >
               {isDownloading ? (
-                <><Loader2 size={12} className="animate-spin" /> Downloading…</>
+                <>
+                  <Loader2 size={12} className="animate-spin" />
+                  {downloadPct > 0 ? `Saving… ${downloadPct}%` : "Downloading…"}
+                </>
               ) : (
                 <><Download size={12} /> Download Video</>
               )}
@@ -305,9 +400,7 @@ export default function App() {
         <div className="mx-6 mt-4 flex items-center gap-3 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-xs">
           <AlertCircle size={14} className="shrink-0" />
           <span className="flex-1">{error}</span>
-          <button onClick={() => setError("")} className="text-red-400 hover:text-white ml-2">
-            ✕
-          </button>
+          <button onClick={() => setError("")} className="text-red-400 hover:text-white ml-2">✕</button>
         </div>
       )}
 
@@ -330,25 +423,22 @@ export default function App() {
             <span>{project.analysisResult.moments.length} viral moments detected</span>
           </div>
 
-          {/* Progress steps */}
           <div className="space-y-2">
             {[
-              { label: "Analyze Video",   done: true },
-              { label: "Select Moments",  done: selectedClipIds.length > 0 },
-              { label: "Edit Clips",      done: Object.values(clipEdits).some(
+              { label: "Analyze Video",     done: true },
+              { label: "Select Moments",    done: selectedClipIds.length > 0 },
+              { label: "Edit Clips",        done: Object.values(clipEdits).some(
                 (e) => e.aspectRatio !== "original" || e.textOverlays.length > 0 ||
                        e.trimStart !== 0 || e.trimEnd !== 0 || e.speed !== 1
               )},
               { label: "Export & Download", done: Object.keys(exportedUrls).length > 0 },
             ].map((s, i) => (
               <div key={i} className="flex items-center gap-2.5 text-xs">
-                <div
-                  className={`w-5 h-5 rounded-full flex items-center justify-center border text-[10px] font-bold shrink-0 ${
-                    s.done
-                      ? "bg-violet-500/20 border-violet-500/40 text-violet-400"
-                      : "bg-white/[0.03] border-white/10 text-zinc-600"
-                  }`}
-                >
+                <div className={`w-5 h-5 rounded-full flex items-center justify-center border text-[10px] font-bold shrink-0 ${
+                  s.done
+                    ? "bg-violet-500/20 border-violet-500/40 text-violet-400"
+                    : "bg-white/[0.03] border-white/10 text-zinc-600"
+                }`}>
                   {s.done ? "✓" : i + 1}
                 </div>
                 <span className={s.done ? "text-zinc-300" : "text-zinc-600"}>{s.label}</span>
@@ -356,20 +446,14 @@ export default function App() {
             ))}
           </div>
 
-          {/* AI summary */}
           <div className="mt-6 pt-5 border-t border-white/[0.05]">
-            <p className="text-[10px] text-zinc-600 uppercase tracking-wider mb-2 font-mono">
-              AI Summary
-            </p>
-            <p className="text-xs text-zinc-500 leading-relaxed">
-              {project.analysisResult.summary}
-            </p>
+            <p className="text-[10px] text-zinc-600 uppercase tracking-wider mb-2 font-mono">AI Summary</p>
+            <p className="text-xs text-zinc-500 leading-relaxed">{project.analysisResult.summary}</p>
           </div>
         </aside>
 
         {/* Main panel */}
         <main className="flex-1 overflow-y-auto min-w-0">
-          {/* Tabs */}
           <div className="sticky top-0 z-10 flex items-center gap-1 px-6 py-3 bg-[#0a0a0f]/90 backdrop-blur border-b border-white/[0.04]">
             <button
               onClick={() => setActivePanel("moments")}
@@ -408,24 +492,20 @@ export default function App() {
                 exportingId={exportingId}
                 onExportClip={(clip) => handleExportClip(clip.moment, clip.edits)}
                 onEditClip={(clip) => handleEditMoment(clip.moment)}
-                onRemoveClip={(id) =>
-                  setSelectedClipIds((prev) => prev.filter((x) => x !== id))
-                }
+                onRemoveClip={(id) => setSelectedClipIds((prev) => prev.filter((x) => x !== id))}
               />
             )}
           </div>
         </main>
       </div>
 
-      {/* Progress toast */}
       {progressMsg && <ProgressToast message={progressMsg} />}
 
-      {/* Video Editor modal */}
       {editingMoment && (
         <VideoEditor
           moment={editingMoment}
           edits={clipEdits[editingMoment.id] || defaultEdits()}
-          videoSrc={project.localVideoUrl ? `${API_BASE}${project.localVideoUrl}` : ""}
+          videoSrc={project.localVideoUrl || ""}
           onUpdateEdits={handleUpdateEdits}
           onExport={handleExportClip}
           onClose={() => setEditingMoment(null)}

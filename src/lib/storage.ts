@@ -1,5 +1,6 @@
 // src/lib/storage.ts
-// All local storage interactions
+// All local storage interactions (project metadata in localStorage)
+// Video blobs are stored separately in IndexedDB via src/lib/videoDB.ts
 
 import type { ViralMoment, VideoAnalysisResult } from "./AI";
 
@@ -49,7 +50,20 @@ export interface Project {
   videoTitle: string;
   videoThumbnail: string;
   videoDuration: number;
+
+  /**
+   * Ephemeral blob: URL (created from IndexedDB, valid for current tab session).
+   * NOT persisted in localStorage — reconstructed from IndexedDB on app load.
+   */
   localVideoUrl?: string;
+
+  /**
+   * The filename used by the local server (e.g. "dQw4w9WgXcQ.mp4").
+   * Persisted in localStorage so the export endpoint can locate the file.
+   * Also serves as the IndexedDB lookup key alongside videoId.
+   */
+  localVideoFileName?: string;
+
   analysisResult: VideoAnalysisResult;
   selectedClips: ProjectClip[];
   createdAt: number;
@@ -59,7 +73,6 @@ export interface Project {
 const STORAGE_KEY = "ai_clipper_projects";
 
 // ─── API Key — read from Vite env, never stored in localStorage ───────────────
-// Set VITE_OPENROUTER_API_KEY in your .env.local file
 export function getApiKey(): string {
   return import.meta.env.VITE_OPENROUTER_API_KEY ?? "";
 }
@@ -73,7 +86,10 @@ export function isApiKeyConfigured(): boolean {
 export function loadProjects(): Project[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
+    if (!raw) return [];
+    const projects: Project[] = JSON.parse(raw);
+    // localVideoUrl is ephemeral — never restore it from localStorage
+    return projects.map((p) => ({ ...p, localVideoUrl: undefined }));
   } catch {
     return [];
   }
@@ -82,8 +98,13 @@ export function loadProjects(): Project[] {
 export function saveProject(project: Project) {
   const projects = loadProjects();
   const idx = projects.findIndex((p) => p.id === project.id);
-  if (idx >= 0) projects[idx] = project;
-  else projects.unshift(project);
+
+  // Strip the ephemeral objectURL before persisting
+  const toSave: Project = { ...project, localVideoUrl: undefined };
+
+  if (idx >= 0) projects[idx] = toSave;
+  else projects.unshift(toSave);
+
   localStorage.setItem(STORAGE_KEY, JSON.stringify(projects.slice(0, 20)));
 }
 

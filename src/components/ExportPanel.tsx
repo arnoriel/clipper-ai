@@ -35,7 +35,7 @@ export default function ExportPanel({
 
   function downloadFile(url: string, filename: string) {
     const a = document.createElement("a");
-    a.href = `http://localhost:3001${url}`;
+    a.href = url;                    // ← FULL Supabase URL, tidak perlu localhost lagi
     a.download = filename;
     document.body.appendChild(a);
     a.click();
