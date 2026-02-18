@@ -5,9 +5,9 @@ import {
   CheckCircle2, AlertCircle, Sparkles, ArrowLeft,
 } from "lucide-react";
 import YouTubeInput from "./components/YoutubeInput";
-import MomentsList from "./components/MomentsList";
-import VideoEditor from "./components/VideoEditor";
-import ExportPanel from "./components/ExportPanel";
+import MomentsList  from "./components/MomentsList";
+import VideoEditor  from "./components/VideoEditor";
+import ExportPanel  from "./components/ExportPanel";
 import { detectViralMoments, formatTime, type ViralMoment } from "./lib/AI";
 import {
   saveProject, defaultEdits, generateId, getApiKey,
@@ -15,16 +15,17 @@ import {
 } from "./lib/storage";
 import {
   getTempVideoUrl,
-  fetchAndStoreTempVideo,
-  fetchAndStoreExportedClip,
+  getTempVideoBlob,
+  readResponseAndStoreTempVideo,
+  uploadAndStoreExportedClip,
   listStoredExportIds,
+  getExportedClip,
 } from "./lib/videoDB";
 
 const API_BASE = "http://localhost:3001";
 
 type Step = "input" | "analyzing" | "moments";
 
-// ─── Progress toast ───────────────────────────────────────────────────────────
 function ProgressToast({ message }: { message: string }) {
   return (
     <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 px-5 py-3 bg-[#1a1a2e] border border-violet-500/30 rounded-2xl shadow-xl shadow-violet-500/10 text-sm text-zinc-300 whitespace-nowrap">
@@ -35,36 +36,32 @@ function ProgressToast({ message }: { message: string }) {
 }
 
 export default function App() {
-  const [step, setStep] = useState<Step>("input");
-  const [project, setProject] = useState<Project | null>(null);
+  const [step, setStep]                   = useState<Step>("input");
+  const [project, setProject]             = useState<Project | null>(null);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [editingMoment, setEditingMoment] = useState<ViralMoment | null>(null);
-  const [clipEdits, setClipEdits] = useState<Record<string, ClipEdits>>({});
+  const [clipEdits, setClipEdits]         = useState<Record<string, ClipEdits>>({});
+  const [exportedUrls, setExportedUrls]   = useState<Record<string, string>>({});
 
-  // exportedUrls: momentId → objectURL (ephemeral, from IndexedDB blob)
-  const [exportedUrls, setExportedUrls] = useState<Record<string, string>>({});
-
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading]         = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const [downloadPct, setDownloadPct] = useState(0);
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportingId, setExportingId] = useState<string | null>(null);
-  const [progressMsg, setProgressMsg] = useState("");
-  const [error, setError] = useState("");
-  const [activePanel, setActivePanel] = useState<"moments" | "export">("moments");
+  const [downloadPct, setDownloadPct]     = useState(0);
+  const [isExporting, setIsExporting]     = useState(false);
+  const [exportingId, setExportingId]     = useState<string | null>(null);
+  const [progressMsg, setProgressMsg]     = useState("");
+  const [error, setError]                 = useState("");
+  const [activePanel, setActivePanel]     = useState<"moments" | "export">("moments");
 
-  // Track current objectURL so we can revoke it on cleanup
   const videoObjectUrlRef = useRef<string | null>(null);
 
-  // ─── On project load: restore video objectURL from IndexedDB ──────────────
+  // ─── Pulihkan objectURL video dari IndexedDB saat project dimuat ──────────
   useEffect(() => {
     if (!project?.videoId) return;
-    if (project.localVideoUrl) return; // already set
+    if (project.localVideoUrl) return;
 
     (async () => {
       const url = await getTempVideoUrl(project.videoId);
       if (url) {
-        // Revoke previous
         if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
         videoObjectUrlRef.current = url;
         setProject((p) => p ? { ...p, localVideoUrl: url } : p);
@@ -72,20 +69,18 @@ export default function App() {
     })();
   }, [project?.videoId]);
 
-  // ─── On project load: restore exported clip objectURLs from IndexedDB ─────
+  // ─── Pulihkan exported clip objectURLs dari IndexedDB ─────────────────────
   useEffect(() => {
     if (!project) return;
     (async () => {
-      const storedIds = await listStoredExportIds();
+      const storedIds  = await listStoredExportIds();
       if (storedIds.length === 0) return;
-
-      const momentIds = project.analysisResult.moments.map((m) => m.id);
-      const relevant  = storedIds.filter((id) => momentIds.includes(id));
+      const momentIds  = project.analysisResult.moments.map((m) => m.id);
+      const relevant   = storedIds.filter((id) => momentIds.includes(id));
       if (relevant.length === 0) return;
 
       const entries = await Promise.all(
         relevant.map(async (momentId) => {
-          const { getTempVideoUrl: _, getExportedClip } = await import("./lib/videoDB");
           const result = await getExportedClip(momentId);
           return result ? ([momentId, result.url] as [string, string]) : null;
         })
@@ -101,7 +96,7 @@ export default function App() {
     })();
   }, [project?.id]);
 
-  // ─── Revoke objectURLs on unmount ─────────────────────────────────────────
+  // ─── Revoke objectURLs saat unmount ───────────────────────────────────────
   useEffect(() => {
     return () => {
       if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
@@ -111,42 +106,42 @@ export default function App() {
     };
   }, []);
 
-  // ─── STEP 1: Analyze video ─────────────────────────────────────────────────
+  // ─── STEP 1: Analisis video ───────────────────────────────────────────────
   async function handleAnalyze(url: string) {
     const apiKey = getApiKey();
     if (!apiKey) {
-      setError("API key not found. Please add VITE_OPENROUTER_API_KEY to your .env.local file.");
+      setError("API key tidak ditemukan. Tambahkan VITE_OPENROUTER_API_KEY ke .env.local");
       return;
     }
 
     setIsLoading(true);
     setError("");
-    setProgressMsg("Fetching video info...");
+    setProgressMsg("Mengambil info video…");
     setStep("analyzing");
 
     try {
       const infoRes = await fetch(`${API_BASE}/api/video-info?url=${encodeURIComponent(url)}`);
       if (!infoRes.ok) {
         const body = await infoRes.json().catch(() => ({}));
-        throw new Error(body.detail || body.error || "Failed to fetch video info");
+        throw new Error(body.detail || body.error || "Gagal mengambil info video");
       }
       const videoInfo = await infoRes.json();
 
       const result = await detectViralMoments(videoInfo, apiKey, (msg) => setProgressMsg(msg));
 
       const proj: Project = {
-        id: generateId(),
-        videoUrl: url,
-        videoId: videoInfo.id,
-        videoTitle: videoInfo.title,
-        videoThumbnail: videoInfo.thumbnail,
-        videoDuration: videoInfo.duration,
-        localVideoUrl: undefined,
+        id:                generateId(),
+        videoUrl:          url,
+        videoId:           videoInfo.id,
+        videoTitle:        videoInfo.title,
+        videoThumbnail:    videoInfo.thumbnail,
+        videoDuration:     videoInfo.duration,
+        localVideoUrl:     undefined,
         localVideoFileName: undefined,
-        analysisResult: result,
-        selectedClips: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
+        analysisResult:    result,
+        selectedClips:     [],
+        createdAt:         Date.now(),
+        updatedAt:         Date.now(),
       };
 
       saveProject(proj);
@@ -157,7 +152,7 @@ export default function App() {
       setActivePanel("moments");
       setStep("moments");
     } catch (err: any) {
-      setError(err.message || "Something went wrong");
+      setError(err.message || "Terjadi kesalahan");
       setStep("input");
     } finally {
       setIsLoading(false);
@@ -165,47 +160,54 @@ export default function App() {
     }
   }
 
-  // ─── Download video → IndexedDB ───────────────────────────────────────────
+  // ─── Download video → langsung ke IndexedDB (tanpa simpan di folder project) ─
+  //
+  // Alur:
+  //   POST /api/download  →  server stream video (dari yt-dlp + OS temp)
+  //                       →  browser baca stream sebagai Blob
+  //                       →  simpan Blob di IndexedDB
+  //                       →  buat objectURL untuk preview
+  //
+  // Tidak ada file yang tersimpan di folder project sama sekali.
   async function handleDownloadVideo() {
     if (!project || project.localVideoUrl) return;
 
     setIsDownloading(true);
     setDownloadPct(0);
-    setProgressMsg("Asking server to download video…");
+    setProgressMsg("Meminta server mengunduh video…");
 
     try {
-      // 1. Ask server to download via yt-dlp
       const res = await fetch(`${API_BASE}/api/download`, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: project.videoUrl, videoId: project.videoId }),
+        body:    JSON.stringify({ url: project.videoUrl, videoId: project.videoId }),
       });
+
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || body.error || "Download failed");
+        throw new Error(body.detail || body.error || "Download gagal");
       }
-      const data: { url: string; fileName: string } = await res.json();
 
-      // 2. Fetch the video blob from local server → store in IndexedDB
-      setProgressMsg("Saving video to browser storage…");
-      const objectUrl = await fetchAndStoreTempVideo(
-        data.url,
+      setProgressMsg("Menyimpan video ke browser IndexedDB…");
+
+      // Baca stream → IndexedDB (dengan progress)
+      const { objectUrl, fileName } = await readResponseAndStoreTempVideo(
+        res,
         project.videoId,
-        data.fileName,
         (pct) => {
           setDownloadPct(pct);
-          setProgressMsg(`Saving to browser storage… ${pct}%`);
+          setProgressMsg(`Menyimpan ke IndexedDB… ${pct}%`);
         }
       );
 
-      // Revoke previous objectURL if any
+      // Revoke objectURL lama jika ada
       if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
       videoObjectUrlRef.current = objectUrl;
 
       const updated: Project = {
         ...project,
         localVideoUrl:      objectUrl,
-        localVideoFileName: data.fileName,
+        localVideoFileName: fileName,
         updatedAt:          Date.now(),
       };
       setProject(updated);
@@ -219,7 +221,7 @@ export default function App() {
     }
   }
 
-  // ─── Toggle clip selection ─────────────────────────────────────────────────
+  // ─── Toggle pilihan clip ──────────────────────────────────────────────────
   function handleToggleSelect(moment: ViralMoment) {
     const isSelected = selectedClipIds.includes(moment.id);
     setSelectedClipIds((prev) =>
@@ -230,7 +232,7 @@ export default function App() {
     }
   }
 
-  // ─── Open editor ───────────────────────────────────────────────────────────
+  // ─── Buka editor ─────────────────────────────────────────────────────────
   function handleEditMoment(moment: ViralMoment) {
     if (!clipEdits[moment.id]) {
       setClipEdits((prev) => ({ ...prev, [moment.id]: defaultEdits() }));
@@ -243,51 +245,59 @@ export default function App() {
     setClipEdits((prev) => ({ ...prev, [editingMoment.id]: edits }));
   }
 
-  // ─── Export clip → IndexedDB ──────────────────────────────────────────────
+  // ─── Export clip → langsung ke IndexedDB (tanpa simpan di folder project) ─
+  //
+  // Alur:
+  //   Ambil Blob video dari IndexedDB
+  //   → upload ke POST /api/export-clip (multipart FormData)
+  //   → server jalankan ffmpeg, stream hasilnya (Fragmented MP4)
+  //   → browser terima Blob
+  //   → simpan di IndexedDB
+  //   → buat objectURL untuk download
+  //
+  // Tidak ada file export yang tersimpan di folder project sama sekali.
   async function handleExportClip(moment: ViralMoment, edits: ClipEdits) {
-    if (!project?.localVideoFileName) {
-      setError("Please download the video first before exporting.");
+    if (!project?.videoId) {
+      setError("Silakan download video terlebih dahulu sebelum export.");
+      return;
+    }
+
+    // Ambil blob dari IndexedDB
+    const videoBlob = await getTempVideoBlob(project.videoId);
+    if (!videoBlob) {
+      setError("Video belum ada di IndexedDB. Silakan download video terlebih dahulu.");
       return;
     }
 
     setIsExporting(true);
     setExportingId(moment.id);
+    setProgressMsg("Mengupload video ke server untuk diproses…");
 
     try {
-      // 1. Ask server to render the clip (it reads the file from its local disk)
-      const res = await fetch(`${API_BASE}/api/export-clip`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          // Pass the server-side filename, NOT a URL or objectURL
-          sourceFile: project.localVideoFileName,
-          clip: {
-            startTime: moment.startTime + edits.trimStart,
-            endTime:   moment.endTime   + edits.trimEnd,
-            label:     moment.label,
-          },
-          edits: {
-            ...edits,
-            textOverlays: edits.textOverlays.map(
-              ({ text, x, y, fontSize, color, startSec, endSec }) => ({
-                text, x, y, fontSize, color, startSec, endSec,
-              })
-            ),
-          },
-        }),
-      });
+      const clip = {
+        startTime: moment.startTime + edits.trimStart,
+        endTime:   moment.endTime   + edits.trimEnd,
+        label:     moment.label,
+      };
 
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || body.error || "Export failed");
-      }
-      const data: { url: string; fileName: string } = await res.json();
+      const editsForServer = {
+        ...edits,
+        textOverlays: edits.textOverlays.map(
+          ({ text, x, y, fontSize, color, startSec, endSec }) => ({
+            text, x, y, fontSize, color, startSec, endSec,
+          })
+        ),
+      };
 
-      // 2. Fetch exported clip blob from server → store in IndexedDB
-      const objectUrl = await fetchAndStoreExportedClip(
-        data.url,
+      setProgressMsg("Server memproses clip, harap tunggu…");
+
+      // Upload blob + terima hasil streaming → simpan ke IndexedDB
+      const objectUrl = await uploadAndStoreExportedClip(
+        `${API_BASE}/api/export-clip`,
+        videoBlob,
         moment.id,
-        data.fileName
+        clip,
+        editsForServer
       );
 
       setExportedUrls((prev) => ({ ...prev, [moment.id]: objectUrl }));
@@ -296,10 +306,11 @@ export default function App() {
     } finally {
       setIsExporting(false);
       setExportingId(null);
+      setProgressMsg("");
     }
   }
 
-  // ─── Derived: clips array for ExportPanel ─────────────────────────────────
+  // ─── Derived clips untuk ExportPanel ─────────────────────────────────────
   const selectedClips: ProjectClip[] = selectedClipIds
     .map((id) => {
       const moment = project?.analysisResult.moments.find((m) => m.id === id);
@@ -325,7 +336,7 @@ export default function App() {
     <div className="min-h-screen bg-[#0a0a0f] text-white flex flex-col">
       <div className="h-px bg-gradient-to-r from-transparent via-violet-500 to-transparent" />
 
-      {/* ── Header ── */}
+      {/* Header */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-white/[0.05] shrink-0">
         <div className="flex items-center gap-4">
           <button
@@ -338,7 +349,7 @@ export default function App() {
               setError("");
             }}
             className="p-2 rounded-xl hover:bg-white/[0.05] text-zinc-500 hover:text-white transition-colors"
-            title="Back to home"
+            title="Kembali ke home"
           >
             <ArrowLeft size={18} />
           </button>
@@ -369,7 +380,7 @@ export default function App() {
               {isDownloading ? (
                 <>
                   <Loader2 size={12} className="animate-spin" />
-                  {downloadPct > 0 ? `Saving… ${downloadPct}%` : "Downloading…"}
+                  {downloadPct > 0 ? `Menyimpan… ${downloadPct}%` : "Mengunduh…"}
                 </>
               ) : (
                 <><Download size={12} /> Download Video</>
@@ -378,7 +389,7 @@ export default function App() {
           ) : (
             <div className="flex items-center gap-1.5 text-xs text-green-400">
               <CheckCircle2 size={12} />
-              Video ready
+              Video siap
             </div>
           )}
 
@@ -395,7 +406,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Error banner ── */}
+      {/* Error banner */}
       {error && (
         <div className="mx-6 mt-4 flex items-center gap-3 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-xs">
           <AlertCircle size={14} className="shrink-0" />
@@ -404,7 +415,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Main layout ── */}
+      {/* Main layout */}
       <div className="flex-1 flex overflow-hidden">
 
         {/* Left sidebar */}
@@ -420,18 +431,18 @@ export default function App() {
           <div className="flex items-center gap-2 text-xs text-zinc-500 mb-6">
             <span className="font-mono">{formatTime(project.videoDuration)}</span>
             <span>·</span>
-            <span>{project.analysisResult.moments.length} viral moments detected</span>
+            <span>{project.analysisResult.moments.length} viral moments terdeteksi</span>
           </div>
 
           <div className="space-y-2">
             {[
-              { label: "Analyze Video",     done: true },
-              { label: "Select Moments",    done: selectedClipIds.length > 0 },
-              { label: "Edit Clips",        done: Object.values(clipEdits).some(
+              { label: "Analisis Video",     done: true },
+              { label: "Pilih Moments",      done: selectedClipIds.length > 0 },
+              { label: "Edit Clips",         done: Object.values(clipEdits).some(
                 (e) => e.aspectRatio !== "original" || e.textOverlays.length > 0 ||
                        e.trimStart !== 0 || e.trimEnd !== 0 || e.speed !== 1
               )},
-              { label: "Export & Download", done: Object.keys(exportedUrls).length > 0 },
+              { label: "Export & Download",  done: Object.keys(exportedUrls).length > 0 },
             ].map((s, i) => (
               <div key={i} className="flex items-center gap-2.5 text-xs">
                 <div className={`w-5 h-5 rounded-full flex items-center justify-center border text-[10px] font-bold shrink-0 ${
@@ -471,7 +482,7 @@ export default function App() {
               }`}
             >
               <Film size={12} />
-              Selected Clips ({selectedClipIds.length})
+              Clips Dipilih ({selectedClipIds.length})
             </button>
           </div>
 

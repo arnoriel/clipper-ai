@@ -1,25 +1,24 @@
 // src/lib/videoDB.ts
-// Browser IndexedDB storage for video blobs
-// Replaces Supabase cloud storage — no size limits, fully offline
+// Browser IndexedDB storage untuk video blob.
+// Semua storage permanen ada di sini — tidak ada file di folder project.
 
-const DB_NAME = "ai-clipper-video-db";
+const DB_NAME    = "ai-clipper-video-db";
 const DB_VERSION = 1;
-const STORE_TEMP    = "temp-videos";   // downloaded source videos
-const STORE_EXPORTS = "clip-exports";  // exported/rendered clips
+const STORE_TEMP    = "temp-videos";
+const STORE_EXPORTS = "clip-exports";
 
-// ─── Internal record shapes ───────────────────────────────────────────────────
 interface TempVideoRecord {
-  videoId:   string;   // YouTube video ID (key)
-  fileName:  string;   // e.g. "abc123.mp4"
-  blob:      Blob;
-  storedAt:  number;   // Date.now()
+  videoId:  string;
+  fileName: string;
+  blob:     Blob;
+  storedAt: number;
 }
 
 interface ExportRecord {
-  momentId:  string;   // moment.id (key)
-  fileName:  string;   // e.g. "clip_1714000000000.mp4"
-  blob:      Blob;
-  storedAt:  number;
+  momentId: string;
+  fileName: string;
+  blob:     Blob;
+  storedAt: number;
 }
 
 // ─── Open / init DB ───────────────────────────────────────────────────────────
@@ -42,7 +41,6 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
-// ─── Helper: wrap IDBRequest in a Promise ─────────────────────────────────────
 function idbRequest<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     req.onsuccess = () => resolve(req.result);
@@ -51,15 +49,9 @@ function idbRequest<T>(req: IDBRequest<T>): Promise<T> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TEMP VIDEOS  (source videos downloaded from YouTube)
+// TEMP VIDEOS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Store a video blob. If one already exists for this videoId it is overwritten.
- * @param videoId  YouTube video ID used as the DB key
- * @param fileName Filename on the local server (e.g. "abc123.mp4")
- * @param blob     Raw MP4 blob fetched from the server
- */
 export async function storeTempVideo(
   videoId:  string,
   fileName: string,
@@ -79,11 +71,8 @@ export async function storeTempVideo(
 }
 
 /**
- * Retrieve the blob for a stored video and return a fresh objectURL.
- * Returns null if nothing is stored for this videoId.
- *
- * ⚠️  Caller is responsible for revoking the URL with URL.revokeObjectURL()
- *     when it is no longer needed (e.g. on component unmount).
+ * Kembalikan objectURL dari blob yang tersimpan.
+ * ⚠️ Caller harus revoke URL dengan URL.revokeObjectURL() jika tidak dipakai.
  */
 export async function getTempVideoUrl(videoId: string): Promise<string | null> {
   const db = await openDB();
@@ -96,7 +85,19 @@ export async function getTempVideoUrl(videoId: string): Promise<string | null> {
   return URL.createObjectURL(record.blob);
 }
 
-/** Get the stored filename for a video (needed to send to the export endpoint). */
+/**
+ * Kembalikan raw Blob dari video yang tersimpan (dipakai untuk upload ke server saat export).
+ */
+export async function getTempVideoBlob(videoId: string): Promise<Blob | null> {
+  const db = await openDB();
+  const tx = db.transaction(STORE_TEMP, "readonly");
+  const record = await idbRequest<TempVideoRecord | undefined>(
+    tx.objectStore(STORE_TEMP).get(videoId)
+  );
+  db.close();
+  return record?.blob ?? null;
+}
+
 export async function getTempVideoFileName(videoId: string): Promise<string | null> {
   const db = await openDB();
   const tx = db.transaction(STORE_TEMP, "readonly");
@@ -107,7 +108,6 @@ export async function getTempVideoFileName(videoId: string): Promise<string | nu
   return record?.fileName ?? null;
 }
 
-/** Delete a stored source video. */
 export async function deleteTempVideo(videoId: string): Promise<void> {
   const db = await openDB();
   const tx = db.transaction(STORE_TEMP, "readwrite");
@@ -119,12 +119,6 @@ export async function deleteTempVideo(videoId: string): Promise<void> {
 // EXPORTED CLIPS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Store a rendered clip blob keyed by momentId.
- * @param momentId Viral moment ID used as the DB key
- * @param fileName Suggested download filename (e.g. "clip_1714000000000.mp4")
- * @param blob     Raw MP4 blob fetched from the server
- */
 export async function storeExportedClip(
   momentId: string,
   fileName: string,
@@ -144,8 +138,8 @@ export async function storeExportedClip(
 }
 
 /**
- * Returns a { url, fileName } pair for a stored exported clip, or null.
- * ⚠️  Caller must revoke the objectURL when done.
+ * Kembalikan { url, fileName } untuk clip yang sudah di-export.
+ * ⚠️ Caller harus revoke URL.
  */
 export async function getExportedClip(
   momentId: string
@@ -157,18 +151,11 @@ export async function getExportedClip(
   );
   db.close();
   if (!record) return null;
-  return {
-    url:      URL.createObjectURL(record.blob),
-    fileName: record.fileName,
-  };
+  return { url: URL.createObjectURL(record.blob), fileName: record.fileName };
 }
 
-/**
- * Trigger a browser download for a stored exported clip.
- * Creates and immediately revokes a temporary objectURL.
- */
 export async function downloadExportedClip(
-  momentId:         string,
+  momentId:          string,
   suggestedFileName: string
 ): Promise<boolean> {
   const result = await getExportedClip(momentId);
@@ -184,7 +171,6 @@ export async function downloadExportedClip(
   return true;
 }
 
-/** Delete a stored exported clip. */
 export async function deleteExportedClip(momentId: string): Promise<void> {
   const db = await openDB();
   const tx = db.transaction(STORE_EXPORTS, "readwrite");
@@ -192,10 +178,6 @@ export async function deleteExportedClip(momentId: string): Promise<void> {
   db.close();
 }
 
-/**
- * Returns a Set of momentIds that have been exported and stored in IndexedDB.
- * Useful for re-hydrating exportedUrls after a page reload.
- */
 export async function listStoredExportIds(): Promise<string[]> {
   const db = await openDB();
   const tx = db.transaction(STORE_EXPORTS, "readonly");
@@ -206,21 +188,23 @@ export async function listStoredExportIds(): Promise<string[]> {
   return keys as string[];
 }
 
-/**
- * Fetch a video blob from a local server URL and store it in IndexedDB.
- * Shows progress via an optional callback (bytes received / total).
- */
-export async function fetchAndStoreTempVideo(
-  serverUrl:        string,
-  videoId:          string,
-  fileName:         string,
-  onProgress?:      (pct: number) => void
-): Promise<string> {
-  const response = await fetch(serverUrl);
-  if (!response.ok) throw new Error(`Failed to fetch video: ${response.statusText}`);
+// ─── Helpers untuk App.tsx ────────────────────────────────────────────────────
 
+/**
+ * Fetch video dari URL (streaming dari server), simpan ke IndexedDB,
+ * kembalikan objectURL.
+ *
+ * Menggantikan fetchAndStoreTempVideo yang lama.
+ * Sekarang menerima Response langsung sehingga kita bisa baca header X-File-Name.
+ */
+export async function readResponseAndStoreTempVideo(
+  response:   Response,
+  videoId:    string,
+  onProgress?: (pct: number) => void
+): Promise<{ objectUrl: string; fileName: string }> {
+  const fileName     = response.headers.get("X-File-Name") ?? `${videoId}.mp4`;
   const contentLength = Number(response.headers.get("Content-Length") ?? 0);
-  const reader  = response.body!.getReader();
+  const reader        = response.body!.getReader();
   const chunks: Uint8Array<ArrayBuffer>[] = [];
   let received = 0;
 
@@ -236,20 +220,34 @@ export async function fetchAndStoreTempVideo(
 
   const blob = new Blob(chunks, { type: "video/mp4" });
   await storeTempVideo(videoId, fileName, blob);
-  return URL.createObjectURL(blob);
+  return { objectUrl: URL.createObjectURL(blob), fileName };
 }
 
 /**
- * Fetch an exported clip blob from a local server URL and store it in IndexedDB.
+ * Upload video blob ke server untuk di-export, terima hasil streaming,
+ * simpan di IndexedDB, kembalikan objectURL.
  */
-export async function fetchAndStoreExportedClip(
+export async function uploadAndStoreExportedClip(
   serverUrl: string,
+  videoBlob: Blob,
   momentId:  string,
-  fileName:  string
+  clip:      object,
+  edits:     object
 ): Promise<string> {
-  const response = await fetch(serverUrl);
-  if (!response.ok) throw new Error(`Failed to fetch export: ${response.statusText}`);
-  const blob = await response.blob();
+  const formData = new FormData();
+  formData.append("video",     videoBlob, "source.mp4");
+  formData.append("clipJson",  JSON.stringify(clip));
+  formData.append("editsJson", JSON.stringify(edits));
+
+  const response = await fetch(serverUrl, { method: "POST", body: formData });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail || body.error || "Export failed");
+  }
+
+  const fileName = response.headers.get("X-File-Name") ?? `clip_${Date.now()}.mp4`;
+  const blob     = await response.blob();
+
   await storeExportedClip(momentId, fileName, blob);
   return URL.createObjectURL(blob);
 }

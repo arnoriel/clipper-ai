@@ -1,60 +1,48 @@
 // ================================================
-// server.js — Local-only storage (no Supabase)
-// Videos are served directly from TEMP_DIR / EXPORT_DIR.
-// The browser fetches the blobs and stores them in IndexedDB.
+// server.js — Stream-first, no project-folder storage
+//
+// Download : yt-dlp → /tmp → stream ke browser → hapus
+// Export   : browser upload blob → /tmp → ffmpeg → stream → hapus
+//
+// Tidak ada file yang disimpan di dalam folder project.
+// Semua storage permanen ada di browser IndexedDB.
 // ================================================
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
-import express from "express";
-import cors from "cors";
-import { exec } from "child_process";
-import { promisify } from "util";
-import fs from "fs";
-import path from "path";
+import express    from "express";
+import cors       from "cors";
+import { exec, spawn } from "child_process";
+import { promisify }   from "util";
+import fs              from "fs";
+import path            from "path";
+import os              from "os";
 import { fileURLToPath } from "url";
-import cron from "node-cron";
+import multer            from "multer";
 
 const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
+const app  = express();
 const PORT = 3001;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({ origin: "http://localhost:5173" }));
 app.use(express.json());
 
-// ─── Directories ─────────────────────────────────────────────────────────────
-const TEMP_DIR   = path.join(__dirname, "temp-videos");
-const EXPORT_DIR = path.join(__dirname, "exports");
+// ─── System temp dir (BUKAN di dalam folder project) ─────────────────────────
+// Semua file sementara disimpan di OS temp dir, dan langsung dihapus setelah
+// streaming selesai. Folder project tetap bersih.
+const SYS_TEMP = path.join(os.tmpdir(), "clipper-ai");
+if (!fs.existsSync(SYS_TEMP)) fs.mkdirSync(SYS_TEMP, { recursive: true });
 
-[TEMP_DIR, EXPORT_DIR].forEach((d) => {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+// ─── Multer — simpan upload browser ke SYS_TEMP, bukan project folder ────────
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, SYS_TEMP),
+    filename:    (_req, _file, cb) => cb(null, `upload_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`),
+  }),
+  limits: { fileSize: 4 * 1024 * 1024 * 1024 }, // max 4 GB
 });
-
-// ─── Static serving ──────────────────────────────────────────────────────────
-// The frontend fetches these URLs, reads the blob, and stores it in IndexedDB.
-// Expose both directories so the browser can download the files directly.
-app.use(
-  "/temp-videos",
-  express.static(TEMP_DIR, {
-    setHeaders: (res) => {
-      res.setHeader("Content-Type", "video/mp4");
-      // Allow byte-range requests so <video> can seek
-      res.setHeader("Accept-Ranges", "bytes");
-    },
-  })
-);
-
-app.use(
-  "/exports",
-  express.static(EXPORT_DIR, {
-    setHeaders: (res) => {
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Accept-Ranges", "bytes");
-    },
-  })
-);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function sanitizeId(str) {
@@ -84,10 +72,19 @@ function parseVTT(vtt) {
   return result.join("\n");
 }
 
+/** Hapus file dengan aman (tidak throw jika tidak ada) */
+function safeDelete(filePath) {
+  try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); }
+  catch (e) { console.warn("⚠️  Could not delete temp file:", filePath, e.message); }
+}
+
 // ─── GET /api/video-info ──────────────────────────────────────────────────────
 app.get("/api/video-info", async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: "Missing url param" });
+
+  // VTT subtitle disimpan sementara di SYS_TEMP, langsung dihapus
+  let vttFile = null;
 
   try {
     const { stdout } = await execAsync(
@@ -99,14 +96,13 @@ app.get("/api/video-info", async (req, res) => {
     let transcript = "";
     try {
       await execAsync(
-        `yt-dlp --write-auto-sub --sub-format vtt --skip-download --no-playlist -o "${TEMP_DIR}/%(id)s.%(ext)s" "${url}"`,
+        `yt-dlp --write-auto-sub --sub-format vtt --skip-download --no-playlist -o "${SYS_TEMP}/%(id)s.%(ext)s" "${url}"`,
         { timeout: 30000 }
       );
-      const vttFile = path.join(TEMP_DIR, `${info.id}.en.vtt`);
+      vttFile = path.join(SYS_TEMP, `${info.id}.en.vtt`);
       if (fs.existsSync(vttFile)) {
         const raw = fs.readFileSync(vttFile, "utf-8");
         transcript = parseVTT(raw);
-        fs.unlinkSync(vttFile);
       }
     } catch (_) {}
 
@@ -123,96 +119,183 @@ app.get("/api/video-info", async (req, res) => {
   } catch (err) {
     console.error(err.message);
     res.status(500).json({ error: "Failed to fetch video info", detail: err.message });
+  } finally {
+    safeDelete(vttFile);
   }
 });
 
 // ─── POST /api/download ───────────────────────────────────────────────────────
-// Downloads the video to TEMP_DIR and returns a local HTTP URL.
-// The client will fetch this URL, read the blob, and persist it in IndexedDB.
+// Alur baru:
+//   1. yt-dlp download ke SYS_TEMP (OS temp, bukan project folder)
+//   2. Stream file ke browser sebagai video/mp4
+//   3. Hapus file dari SYS_TEMP
+//   4. Browser terima blob → simpan di IndexedDB
+//
+// Header X-File-Name dikirim agar client tahu nama file yang disarankan.
 app.post("/api/download", async (req, res) => {
   const { url, videoId } = req.body;
   if (!url || !videoId) return res.status(400).json({ error: "Missing url or videoId" });
 
-  const safeId     = sanitizeId(videoId);
-  const fileName   = `${safeId}.mp4`;
-  const outputPath = path.join(TEMP_DIR, fileName);
-
-  // If the file already exists on disk, return it immediately
-  if (fs.existsSync(outputPath)) {
-    console.log(`✅ File already on disk: ${fileName}`);
-    return res.json({
-      url:      `http://localhost:${PORT}/temp-videos/${fileName}`,
-      fileName,
-    });
-  }
+  const safeId    = sanitizeId(videoId);
+  const fileName  = `${safeId}.mp4`;
+  const tempPath  = path.join(SYS_TEMP, `dl_${Date.now()}_${fileName}`);
 
   try {
-    console.log(`📥 Downloading: ${safeId}`);
+    console.log(`📥 Downloading (to system temp): ${safeId}`);
     await execAsync(
-      `yt-dlp -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputPath}" --no-playlist "${url}"`,
-      { timeout: 300000 }
+      `yt-dlp -f "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+       --merge-output-format mp4 \
+       -o "${tempPath}" \
+       --no-playlist "${url}"`,
+      { timeout: 300_000 }
     );
 
-    res.json({
-      url:      `http://localhost:${PORT}/temp-videos/${fileName}`,
-      fileName,
+    if (!fs.existsSync(tempPath)) {
+      throw new Error("yt-dlp selesai tapi file tidak ditemukan di temp dir");
+    }
+
+    const stat = fs.statSync(tempPath);
+    console.log(`✅ Download selesai (${(stat.size / 1_048_576).toFixed(1)} MB), streaming ke browser…`);
+
+    // Kirim nama file sebagai header agar client bisa simpan di IndexedDB dengan nama benar
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", stat.size);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("X-File-Name", fileName);
+    res.setHeader("Access-Control-Expose-Headers", "X-File-Name");
+
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+
+    // Hapus file setelah stream selesai
+    readStream.on("close", () => {
+      safeDelete(tempPath);
+      console.log(`🗑️  Temp file dihapus: ${path.basename(tempPath)}`);
     });
+    res.on("error", () => safeDelete(tempPath));
+
   } catch (err) {
+    safeDelete(tempPath);
     console.error("❌ Download Error:", err.message);
     res.status(500).json({ error: "Download failed", detail: err.message });
   }
 });
 
 // ─── POST /api/export-clip ────────────────────────────────────────────────────
-// sourceFile = plain filename (e.g. "abc123.mp4"), resolved against TEMP_DIR.
-// Returns a local HTTP URL the client can fetch to retrieve the exported blob.
-app.post("/api/export-clip", async (req, res) => {
-  const { sourceFile, clip, edits } = req.body;
-  if (!sourceFile || !clip) return res.status(400).json({ error: "Missing params" });
+// Alur baru:
+//   1. Browser upload video blob sebagai multipart/form-data (field: "video")
+//   2. Terima edits sebagai JSON di field "editsJson"
+//   3. ffmpeg proses dari file upload → output fragmented MP4 ke stdout
+//   4. Stream stdout ke browser
+//   5. Hapus file upload dari SYS_TEMP
+//   6. Browser terima blob → simpan di IndexedDB
+//
+// Catatan: outputnya adalah Fragmented MP4 agar bisa di-stream tanpa
+//          perlu menulis file output ke disk.
+app.post(
+  "/api/export-clip",
+  upload.single("video"),
+  async (req, res) => {
+    const uploadedPath = req.file?.path;
 
-  // sourceFile is just the filename — never a full URL here
-  const resolvedSource = path.join(TEMP_DIR, path.basename(sourceFile));
-  if (!fs.existsSync(resolvedSource)) {
-    return res.status(404).json({
-      error: "Source video not found on server. Please re-download the video.",
-    });
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Field 'video' tidak ditemukan dalam upload" });
+      }
+
+      // edits dan clip dikirim sebagai JSON string di field terpisah
+      const editsJson = req.body.editsJson;
+      const clipJson  = req.body.clipJson;
+      if (!editsJson || !clipJson) {
+        return res.status(400).json({ error: "Field 'editsJson' dan 'clipJson' diperlukan" });
+      }
+
+      const edits = JSON.parse(editsJson);
+      const clip  = JSON.parse(clipJson);
+
+      const startSec    = clip.startTime;
+      const durationSec = clip.endTime - clip.startTime;
+      const filters     = buildFFmpegFilters(edits);
+      const speed       = edits?.speed || 1;
+
+      // ffmpeg: baca dari file upload, output fragmented MP4 ke stdout (pipe:1)
+      // Fragmented MP4 (frag_keyframe + empty_moov) tidak perlu seekable output,
+      // sehingga bisa di-pipe langsung ke HTTP response.
+      const ffmpegArgs = [
+        "-y",
+        "-ss", secondsToFFmpeg(startSec),
+        "-i",  uploadedPath,
+        "-t",  secondsToFFmpeg(durationSec),
+        ...(filters.length ? ["-vf", filters.join(",")] : []),
+        ...(speed !== 1    ? ["-af", `atempo=${Math.min(Math.max(speed, 0.5), 2)}`] : []),
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        // Fragmented MP4 untuk streaming ke stdout
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "pipe:1",
+      ];
+
+      console.log(`🎬 Exporting clip via ffmpeg (streaming ke browser)…`);
+
+      const ffmpeg = spawn("ffmpeg", ffmpegArgs);
+
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("X-File-Name", `clip_${Date.now()}.mp4`);
+      res.setHeader("Access-Control-Expose-Headers", "X-File-Name");
+      res.setHeader("Transfer-Encoding", "chunked");
+
+      ffmpeg.stdout.pipe(res);
+
+      let stderrBuf = "";
+      ffmpeg.stderr.on("data", (d) => { stderrBuf += d.toString(); });
+
+      ffmpeg.on("close", (code) => {
+        safeDelete(uploadedPath);
+        if (code !== 0) {
+          console.error("[ffmpeg error]", stderrBuf.slice(-500));
+          // Response mungkin sudah sebagian terkirim, tidak bisa kirim JSON error
+          // — cukup tutup koneksi
+          if (!res.headersSent) {
+            res.status(500).json({ error: "ffmpeg failed", detail: stderrBuf.slice(-300) });
+          } else {
+            res.end();
+          }
+        } else {
+          console.log(`✅ Export selesai, temp upload dihapus`);
+        }
+      });
+
+      ffmpeg.on("error", (err) => {
+        safeDelete(uploadedPath);
+        console.error("[ffmpeg spawn error]", err.message);
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Failed to start ffmpeg", detail: err.message });
+        } else {
+          res.end();
+        }
+      });
+
+      res.on("close", () => {
+        // Jika client disconnect sebelum selesai, kill ffmpeg
+        if (!ffmpeg.killed) ffmpeg.kill("SIGKILL");
+        safeDelete(uploadedPath);
+      });
+
+    } catch (err) {
+      safeDelete(uploadedPath);
+      console.error("[export error]", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Export failed", detail: err.message });
+      }
+    }
   }
+);
 
-  const outName = `clip_${Date.now()}.mp4`;
-  const outPath = path.join(EXPORT_DIR, outName);
-
-  try {
-    const filters    = buildFFmpegFilters(edits || {});
-    const speed      = edits?.speed || 1;
-    const startSec   = clip.startTime;
-    const durationSec = clip.endTime - clip.startTime;
-
-    const cmd = [
-      "ffmpeg -y",
-      `-ss ${secondsToFFmpeg(startSec)}`,
-      `-i "${resolvedSource}"`,
-      `-t ${secondsToFFmpeg(durationSec)}`,
-      filters.length ? `-vf "${filters.join(",")}"` : "",
-      speed !== 1 ? `-af "atempo=${Math.min(Math.max(speed, 0.5), 2)}"` : "",
-      "-c:v libx264 -preset fast -crf 22",
-      "-c:a aac -b:a 128k",
-      "-movflags +faststart",
-      `"${outPath}"`,
-    ].filter(Boolean).join(" ");
-
-    console.log(`🎬 Rendering: ${outName}`);
-    await execAsync(cmd, { timeout: 120000 });
-
-    res.json({
-      url:      `http://localhost:${PORT}/exports/${outName}`,
-      fileName: outName,
-    });
-  } catch (err) {
-    console.error("[export error]", err.message);
-    res.status(500).json({ error: "Export failed", detail: err.message });
-  }
-});
-
+// ─── buildFFmpegFilters (sama seperti sebelumnya) ─────────────────────────────
 function buildFFmpegFilters(edits) {
   const filters = [];
 
@@ -254,37 +337,17 @@ function buildFFmpegFilters(edits) {
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────
-app.get("/api/health", (_, res) =>
-  res.json({ ok: true, storage: "Local filesystem + browser IndexedDB" })
+app.get("/api/health", (_req, res) =>
+  res.json({
+    ok:      true,
+    storage: "Stream-only — tidak ada file yang disimpan di folder project",
+    tmpDir:  SYS_TEMP,
+  })
 );
-
-// ─── Auto Cleanup (every 30 min) ─────────────────────────────────────────────
-// Removes local files older than 2 hours.
-// The browser's IndexedDB is unaffected — user controls that storage.
-cron.schedule("*/30 * * * *", () => {
-  console.log("🧹 Running local file cleanup...");
-  const MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-  [TEMP_DIR, EXPORT_DIR].forEach((dir) => {
-    try {
-      for (const file of fs.readdirSync(dir)) {
-        const fp   = path.join(dir, file);
-        const stat = fs.statSync(fp);
-        if (Date.now() - stat.mtimeMs > MAX_AGE_MS) {
-          fs.unlinkSync(fp);
-          console.log(`  🗑️  Deleted ${file}`);
-        }
-      }
-    } catch (e) {
-      console.warn("Cleanup error:", e.message);
-    }
-  });
-});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 AI Clipper Backend → http://localhost:${PORT}`);
-  console.log(`   Videos served from: ${TEMP_DIR}`);
-  console.log(`   Exports served from: ${EXPORT_DIR}`);
-  console.log(`   Storage: Local disk → browser IndexedDB (no cloud)\n`);
+  console.log(`   OS Temp dir  : ${SYS_TEMP}`);
+  console.log(`   Storage mode : Stream ke browser → IndexedDB (folder project tetap bersih)\n`);
 });
