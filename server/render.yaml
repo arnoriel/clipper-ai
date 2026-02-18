@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: clipper-ai-backend
+    env: node
+    plan: free
+    buildCommand: |
+      apt-get update
+      apt-get install -y ffmpeg python3-pip
+      pip install yt-dlp
+      npm install
+    startCommand: node server.js
+    rootDir: server

@@ -23,10 +23,16 @@ import multer            from "multer";
 const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app  = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: "http://localhost:5173" }));
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "https://namaprojectkamu.vercel.app"
+  ]
+}));
+
 app.use(express.json());
 
 // ─── System temp dir (BUKAN di dalam folder project) ─────────────────────────
